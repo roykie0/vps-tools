@@ -5,6 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_NAME="VPS Panel Setup"
+readonly SCRIPT_VERSION="2026.07.10-3xui-fix"
 readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
 readonly SUI_INSTALL_URL="https://s-ui.alireza0.dev/install.sh"
 readonly SHORTCUT_NAME="roy"
@@ -12,6 +13,7 @@ readonly LOCAL_SCRIPT_PATH="/usr/local/lib/vps-panel-setup/${SHORTCUT_NAME}"
 readonly ROY_DATA_DIR="/root/.roy"
 readonly PANEL_INFO_FILE="${ROY_DATA_DIR}/panel-info.conf"
 readonly NODE_INFO_FILE="${ROY_DATA_DIR}/nodes.txt"
+readonly NODE_LOG_FILE="${ROY_DATA_DIR}/node-create.log"
 APT_INDEX_READY=false
 
 GREEN='\033[0;32m'
@@ -43,15 +45,39 @@ require_root() {
 }
 
 install_shortcut() {
-  local source_file="${BASH_SOURCE[0]}"
-  if [[ ! -r "$source_file" ]]; then
-    warn "无法创建快捷命令。请从本地脚本文件运行后再重试。"
+  local source_file="${BASH_SOURCE[0]}" source_real="" target_real="" temp_file=""
+  install -d -m 755 "$(dirname "$LOCAL_SCRIPT_PATH")"
+
+  # 通过 bash <(curl ...) 运行时，源文件是一次性管道，必须重新下载后再保存。
+  if [[ "$source_file" == /dev/fd/* || "$source_file" == /proc/self/fd/* ]]; then
+    temp_file="$(mktemp /tmp/roy-shortcut.XXXXXX)"
+    if ! curl -4fsSL --connect-timeout 10 --max-time 60 \
+      https://raw.githubusercontent.com/roykie0/vps-tools/main/install.sh -o "$temp_file"; then
+      rm -f "$temp_file"
+      warn "快捷命令安装失败：无法下载脚本。"
+      return
+    fi
+    install -m 755 "$temp_file" "$LOCAL_SCRIPT_PATH"
+    rm -f "$temp_file"
+  elif [[ -r "$source_file" ]]; then
+    source_real="$(readlink -f "$source_file" 2>/dev/null || printf '%s' "$source_file")"
+    target_real="$(readlink -f "$LOCAL_SCRIPT_PATH" 2>/dev/null || true)"
+    if [[ "$source_real" != "$target_real" ]]; then
+      install -m 755 "$source_file" "$LOCAL_SCRIPT_PATH"
+    fi
+  else
+    warn "无法创建快捷命令：当前脚本不可读取。"
     return
   fi
 
-  install -d -m 755 "$(dirname "$LOCAL_SCRIPT_PATH")"
-  install -m 755 "$source_file" "$LOCAL_SCRIPT_PATH"
-  ln -sfn "$LOCAL_SCRIPT_PATH" "/usr/local/bin/${SHORTCUT_NAME}"
+  rm -f "/usr/local/bin/${SHORTCUT_NAME}"
+  cat >"/usr/local/bin/${SHORTCUT_NAME}" <<EOF
+#!/usr/bin/env bash
+exec bash "$LOCAL_SCRIPT_PATH" "\$@"
+EOF
+  chmod 755 "/usr/local/bin/${SHORTCUT_NAME}"
+  ln -sfn "/usr/local/bin/${SHORTCUT_NAME}" "/usr/bin/${SHORTCUT_NAME}"
+  hash -r 2>/dev/null || true
 }
 
 offer_disable_existing_ufw() {
@@ -271,6 +297,42 @@ detect_web_scheme() {
   fi
 }
 
+xui_binary() {
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    printf '%s' /usr/local/x-ui/x-ui
+  elif command -v x-ui >/dev/null 2>&1; then
+    command -v x-ui
+  else
+    return 1
+  fi
+}
+
+wait_for_panel() {
+  local scheme="$1" port="$2" path="$3" attempt status
+  for attempt in {1..15}; do
+    status="$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 3 \
+      "${scheme}://127.0.0.1:${port}${path}" 2>/dev/null || true)"
+    if [[ "$status" =~ ^(200|301|302|303|307|308)$ ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+configure_xui_access() {
+  local username="$1" password="$2" port="$3" path="$4" log_file="$5" xui_bin
+  xui_bin="$(xui_binary)" || return 1
+
+  # 无域名模式使用 HTTP 并监听全部 IPv4 地址，避免证书或 127.0.0.1 绑定导致外网打不开。
+  "$xui_bin" setting -username "$username" -password "$password" -port "$port" \
+    -webBasePath "$path" -listenIP "0.0.0.0" >>"$log_file" 2>&1 || return 1
+  "$xui_bin" cert -reset true >>"$log_file" 2>&1 || return 1
+  systemctl enable x-ui >>"$log_file" 2>&1 || true
+  systemctl restart x-ui >>"$log_file" 2>&1 || return 1
+  wait_for_panel http "$port" "/${path}/"
+}
+
 save_panel_info() {
   local panel_type="$1" host="$2" port="$3" path="$4" username="$5" password="$6"
   local sub_port="${7:-}" sub_path="${8:-}" panel_scheme="${9:-http}" sub_scheme="${10:-http}"
@@ -337,10 +399,11 @@ show_access_hint() {
 }
 
 create_recommended_3x_nodes() {
-  local username="$1" password="$2" panel_port="$3" panel_path="$4"
-  local main_port backup_port xray_bin keypair private_key public_key short_id uuid ss_password
-  local cookie_file main_payload backup_payload panel_base panel_scheme main_result backup_result
-  local server_ip display_host ss_userinfo vless_link ss_link
+  local panel_port="$1" panel_path="$2"
+  local main_port backup_port xray_bin keypair private_key public_key short_id uuid
+  local ss_server_password ss_user_password ss_client_password
+  local main_payload backup_payload panel_base main_result backup_result api_token xui_bin list_result
+  local server_ip display_host ss_userinfo vless_link ss_link main_ok=false backup_ok=false
 
   if ! confirm "是否自动创建无域名推荐节点？"; then
     return
@@ -366,21 +429,44 @@ create_recommended_3x_nodes() {
   fi
   short_id="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
-  ss_password="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
-  cookie_file="$(mktemp)"
+  ss_server_password="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+  ss_user_password="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+  ss_client_password="${ss_server_password}:${ss_user_password}"
   main_payload="$(mktemp)"
   backup_payload="$(mktemp)"
-  panel_scheme="$(detect_web_scheme "$panel_port")"
-  panel_base="${panel_scheme}://127.0.0.1:${panel_port}/${panel_path}"
-
-  if ! curl -kfsS -c "$cookie_file" --data-urlencode "username=${username}" --data-urlencode "password=${password}" "${panel_base}/login" >/dev/null; then
-    rm -f "$cookie_file" "$main_payload" "$backup_payload"
-    warn "无法登录 3x-ui API，已保留面板安装结果，但跳过自动创建节点。"
+  panel_base="http://127.0.0.1:${panel_port}/${panel_path}"
+  if ! xui_bin="$(xui_binary)"; then
+    rm -f "$main_payload" "$backup_payload"
+    warn "未找到 3x-ui 主程序，节点未创建。"
     return
   fi
-  main_settings="$(printf '{"clients":[{"id":"%s","flow":"xtls-rprx-vision","email":"main-user"}],"decryption":"none"}' "$uuid")"
-  main_stream="$(printf '{"network":"tcp","security":"reality","realitySettings":{"show":false,"dest":"www.microsoft.com:443","xver":0,"serverNames":["www.microsoft.com"],"privateKey":"%s","shortIds":["%s"]}}' "$private_key" "$short_id")"
-  backup_settings="$(printf '{"clients":[{"email":"backup-user","method":"2022-blake3-aes-256-gcm","password":"%s"}],"network":"tcp,udp"}' "$ss_password")"
+  api_token="$("$xui_bin" setting -getApiToken true 2>/dev/null | awk -F':[[:space:]]*' '/apiToken:/ {print $2; exit}')"
+  install -d -m 700 "$ROY_DATA_DIR"
+  : >"$NODE_LOG_FILE"
+  chmod 600 "$NODE_LOG_FILE"
+
+  if [[ -z "$api_token" ]]; then
+    rm -f "$main_payload" "$backup_payload"
+    warn "无法取得 3x-ui API Token，节点未创建。诊断日志：${NODE_LOG_FILE}"
+    printf '%s\n' "错误：无法取得 3x-ui API Token。" >"$NODE_LOG_FILE"
+    return
+  fi
+
+  list_result="$(curl -ksS --max-time 8 -H "Authorization: Bearer ${api_token}" \
+    "${panel_base}/panel/api/inbounds/list" 2>&1 || true)"
+  if ! grep -Eq '"success"[[:space:]]*:[[:space:]]*true' <<<"$list_result"; then
+    rm -f "$main_payload" "$backup_payload"
+    {
+      echo "错误：API Token 验证失败。"
+      echo "接口：${panel_base}/panel/api/inbounds/list"
+      echo "返回：${list_result}"
+    } >"$NODE_LOG_FILE"
+    warn "3x-ui API 验证失败，节点未创建。诊断日志：${NODE_LOG_FILE}"
+    return
+  fi
+  main_settings="$(printf '{"clients":[{"id":"%s","flow":"xtls-rprx-vision","email":"main-user","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":""}],"decryption":"none","encryption":"none"}' "$uuid")"
+  main_stream="$(printf '{"network":"tcp","security":"reality","tcpSettings":{"acceptProxyProtocol":false,"header":{"type":"none"}},"realitySettings":{"show":false,"target":"www.microsoft.com:443","xver":0,"serverNames":["www.microsoft.com"],"privateKey":"%s","shortIds":["%s"],"settings":{"publicKey":"%s","fingerprint":"chrome","serverName":"","spiderX":"/"}}}' "$private_key" "$short_id" "$public_key")"
+  backup_settings="$(printf '{"method":"2022-blake3-aes-256-gcm","password":"%s","clients":[{"email":"backup-user","password":"%s","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":""}],"network":"tcp,udp"}' "$ss_server_password" "$ss_user_password")"
   sniffing='{"enabled":true,"destOverride":["http","tls","quic"]}'
   json_escape() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
   cat >"$main_payload" <<EOF
@@ -390,35 +476,66 @@ EOF
 {"remark":"备用-Shadowsocks-2022","enable":true,"port":${backup_port},"protocol":"shadowsocks","settings":"$(printf '%s' "$backup_settings" | json_escape)","streamSettings":"$(printf '%s' '{"network":"tcp","security":"none"}' | json_escape)","sniffing":"$(printf '%s' "$sniffing" | json_escape)"}
 EOF
 
-  main_result="$(curl -kfsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${main_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
-  backup_result="$(curl -kfsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${backup_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
-  rm -f "$cookie_file" "$main_payload" "$backup_payload"
+  main_result="$(curl -ksS --max-time 12 -H "Authorization: Bearer ${api_token}" \
+    -H 'Content-Type: application/json' --data-binary "@${main_payload}" \
+    "${panel_base}/panel/api/inbounds/add" 2>&1 || true)"
+  backup_result="$(curl -ksS --max-time 12 -H "Authorization: Bearer ${api_token}" \
+    -H 'Content-Type: application/json' --data-binary "@${backup_payload}" \
+    "${panel_base}/panel/api/inbounds/add" 2>&1 || true)"
+  rm -f "$main_payload" "$backup_payload"
+  grep -Eq '"success"[[:space:]]*:[[:space:]]*true' <<<"$main_result" && main_ok=true
+  grep -Eq '"success"[[:space:]]*:[[:space:]]*true' <<<"$backup_result" && backup_ok=true
+  {
+    echo "主用节点接口返回：${main_result}"
+    echo "备用节点接口返回：${backup_result}"
+  } >"$NODE_LOG_FILE"
 
-  if [[ "$main_result" == *'"success":true'* && "$backup_result" == *'"success":true'* ]]; then
+  if [[ "$main_ok" == true || "$backup_ok" == true ]]; then
     server_ip="$(get_server_ip)"
     display_host="$(url_host "$server_ip")"
-    ss_userinfo="$(printf '2022-blake3-aes-256-gcm:%s' "$ss_password" | base64 | tr -d '\n=' | tr '+/' '-_')"
+    ss_userinfo="$(printf '2022-blake3-aes-256-gcm:%s' "$ss_client_password" | base64 | tr -d '\n=' | tr '+/' '-_')"
     vless_link="vless://${uuid}@${display_host}:${main_port}?type=tcp&security=reality&pbk=${public_key}&fp=chrome&sni=www.microsoft.com&sid=${short_id}&spx=%2F&flow=xtls-rprx-vision#Roy-Main-Reality"
     ss_link="ss://${ss_userinfo}@${display_host}:${backup_port}#Roy-Backup-SS2022"
-    install -d -m 700 "$ROY_DATA_DIR"
-    cat >"$NODE_INFO_FILE" <<EOF
+    systemctl restart x-ui >/dev/null 2>&1 || true
+    sleep 2
+    if [[ "$main_ok" == true ]] && ! port_in_use "$main_port"; then
+      main_ok=false
+      echo "错误：重启后主用节点端口 ${main_port} 没有监听。" >>"$NODE_LOG_FILE"
+    fi
+    if [[ "$backup_ok" == true ]] && ! port_in_use "$backup_port"; then
+      backup_ok=false
+      echo "错误：重启后备用节点端口 ${backup_port} 没有监听。" >>"$NODE_LOG_FILE"
+    fi
+
+    : >"$NODE_INFO_FILE"
+    if [[ "$main_ok" == true ]]; then
+      cat >>"$NODE_INFO_FILE" <<EOF
 主用节点：VLESS + Reality + Vision
 端口：${main_port}
 导入链接：
 ${vless_link}
-
+EOF
+    fi
+    if [[ "$backup_ok" == true ]]; then
+      cat >>"$NODE_INFO_FILE" <<EOF
 备用节点：Shadowsocks 2022
 端口：${backup_port}
 导入链接：
 ${ss_link}
 EOF
+    fi
     chmod 600 "$NODE_INFO_FILE"
-    systemctl restart x-ui >/dev/null 2>&1 || true
-    say "已创建主用 VLESS Reality 和备用 Shadowsocks 2022 节点。"
-    info "完整节点链接已保存到：${NODE_INFO_FILE}"
-    show_saved_nodes
+    [[ "$main_ok" == true ]] && say "主用 VLESS Reality 节点已创建。" || warn "主用节点创建失败，请查看诊断日志。"
+    [[ "$backup_ok" == true ]] && say "备用 Shadowsocks 2022 节点已创建。" || warn "备用节点创建失败，请查看诊断日志。"
+    if [[ -s "$NODE_INFO_FILE" ]]; then
+      info "已验证的节点链接保存到：${NODE_INFO_FILE}"
+      show_saved_nodes
+    else
+      rm -f "$NODE_INFO_FILE"
+      warn "节点接口虽然返回成功，但端口没有监听。诊断日志：${NODE_LOG_FILE}"
+    fi
   else
-    warn "推荐节点创建未完成。请在面板中手动检查入站列表，未成功的请求不会影响面板本身。"
+    warn "推荐节点创建失败。详细原因已保存到：${NODE_LOG_FILE}"
   fi
 }
 
@@ -540,27 +657,75 @@ install_3x_ui_chinese() {
   installer_file="$(mktemp /tmp/3x-ui-installer.XXXXXX)"
   log_file="/var/log/vps-panel-3x-ui-install.log"
   curl -fsSL "$XUI_INSTALL_URL" -o "$installer_file"
-  if ! XUI_NONINTERACTIVE=1 bash "$installer_file" >"$log_file" 2>&1 </dev/null; then
+  if ! XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none bash "$installer_file" >"$log_file" 2>&1 </dev/null; then
     rm -f "$installer_file"
     fail "3x-ui 安装失败，详细日志：${log_file}"
     return 1
   fi
   rm -f "$installer_file"
 
-  if ! x-ui setting -username "$username" -password "$password" -port "$port" -webBasePath "$path" >>"$log_file" 2>&1; then
-    fail "3x-ui 已安装，但初始化后台设置失败。详细日志：${log_file}"
+  if ! configure_xui_access "$username" "$password" "$port" "$path" "$log_file"; then
+    fail "3x-ui 已安装，但后台访问验证失败。请在主菜单选择 7 自动修复。日志：${log_file}"
     return 1
   fi
-  systemctl restart x-ui >>"$log_file" 2>&1 || true
   server_ip="$(get_server_ip)"
-  panel_scheme="$(detect_web_scheme "$port")"
-  save_panel_info "3x-ui" "$server_ip" "$port" "/${path}" "$username" "$password" "" "" "$panel_scheme" "http"
-  create_recommended_3x_nodes "$username" "$password" "$port" "$path"
+  panel_scheme="http"
+  save_panel_info "3x-ui" "$server_ip" "$port" "/${path}/" "$username" "$password" "" "" "$panel_scheme" "http"
+  create_recommended_3x_nodes "$port" "$path"
   echo
   info "后台用户名：${username}"
   info "后台密码：${password}"
-  show_access_hint '3x-ui' "$panel_scheme" "$(url_host "$server_ip")" "$port" "/${path}"
+  show_access_hint '3x-ui' "$panel_scheme" "$(url_host "$server_ip")" "$port" "/${path}/"
   info "以后输入 roy，再选择“查看面板、登录信息、节点与安全服务状态”即可重新查看。"
+}
+
+repair_3x_ui() {
+  local xui_bin settings current_port current_path username password port path server_ip log_file
+  require_supported_os
+  xui_bin="$(xui_binary)" || {
+    fail "没有检测到 3x-ui，请先选择 4 安装。"
+    return 1
+  }
+  settings="$("$xui_bin" setting -show true 2>/dev/null || true)"
+  current_port="$(awk -F':[[:space:]]*' '/^port:/ {print $2; exit}' <<<"$settings")"
+  current_path="$(awk -F':[[:space:]]*' '/^webBasePath:/ {print $2; exit}' <<<"$settings" | sed 's#^/##; s#/$##')"
+  [[ "$current_port" =~ ^[0-9]+$ ]] || current_port=2053
+  [[ -n "$current_path" ]] || current_path="$(random_text 16)"
+
+  warn "修复会重设后台用户名和密码，并切换为无域名可访问的 HTTP 模式。"
+  username="$(ask_text '请输入新的后台用户名' "admin$(random_text 5)")"
+  password="$(ask_text '请输入新的后台密码' "$(random_text 16)")"
+  port="$(ask_text '请输入修复后的后台端口' "$current_port")"
+  path="$(ask_text '请输入修复后的后台路径' "$current_path")"
+  path="${path#/}"
+  path="${path%/}"
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    fail "端口必须是 1 到 65535 之间的数字。"
+    return 1
+  fi
+  if [[ "$port" != "$current_port" ]] && port_in_use "$port"; then
+    fail "端口 ${port} 已被其他程序使用，请重新修复并换一个端口。"
+    return 1
+  fi
+  if [[ -z "$path" ]]; then
+    fail "后台路径不能为空。"
+    return 1
+  fi
+
+  log_file="/var/log/vps-panel-3x-ui-repair.log"
+  if ! configure_xui_access "$username" "$password" "$port" "$path" "$log_file"; then
+    fail "修复后仍无法从 VPS 本机访问后台。日志：${log_file}"
+    systemctl status x-ui --no-pager -l 2>/dev/null | tail -n 20 || true
+    return 1
+  fi
+  server_ip="$(get_server_ip)"
+  save_panel_info "3x-ui" "$server_ip" "$port" "/${path}/" "$username" "$password" "" "" "http" "http"
+  say "3x-ui 后台已修复并通过本机访问验证。"
+  info "后台地址：http://$(url_host "$server_ip"):${port}/${path}/"
+  info "后台用户名：${username}"
+  info "后台密码：${password}"
+  create_recommended_3x_nodes "$port" "$path"
+  info "以后直接输入 roy 即可重新打开本脚本。"
 }
 
 install_s_ui_chinese() {
@@ -670,6 +835,13 @@ show_service_status() {
 
   echo
   info "3x-ui 安装日志：/var/log/vps-panel-3x-ui-install.log"
+  if [[ -s "$NODE_LOG_FILE" ]]; then
+    info "节点创建诊断日志：${NODE_LOG_FILE}"
+    if [[ ! -s "$NODE_INFO_FILE" ]]; then
+      warn "最近一次节点创建没有成功，诊断摘要如下："
+      tail -n 8 "$NODE_LOG_FILE"
+    fi
+  fi
   info "S-UI 安装日志：/var/log/vps-panel-s-ui-install.log"
 }
 
@@ -677,6 +849,7 @@ show_header() {
   clear
   printf '%b\n' "${CYAN}============================================${RESET}"
   printf '%b\n' "${CYAN}         ${SCRIPT_NAME}${RESET}"
+  printf '%b\n' "${CYAN}        版本 ${SCRIPT_VERSION}${RESET}"
   printf '%b\n' "${CYAN}        Ubuntu / Debian 专用${RESET}"
   printf '%b\n\n' "${CYAN}============================================${RESET}"
 }
@@ -692,9 +865,10 @@ main_menu() {
 4) 安装 3x-ui（Xray 管理面板）
 5) 安装 S-UI（Sing-box 管理面板）
 6) 查看面板、登录信息、节点与安全服务状态
+7) 修复现有 3x-ui 后台、roy 命令并创建推荐节点
 0) 退出
 EOF
-    read -r -p "请输入选项 [0-6]: " choice
+    read -r -p "请输入选项 [0-7]: " choice
     case "$choice" in
       1) run_optimization; pause ;;
       2) configure_network_acceleration; pause ;;
@@ -702,8 +876,9 @@ EOF
       4) run_installer "3x-ui" 'xui'; pause ;;
       5) run_installer "S-UI" 'sui'; pause ;;
       6) show_service_status; pause ;;
+      7) install_shortcut; repair_3x_ui; pause ;;
       0) info "已退出。"; exit 0 ;;
-      *) warn "请输入 0 到 6 之间的数字。"; pause ;;
+      *) warn "请输入 0 到 7 之间的数字。"; pause ;;
     esac
   done
 }
