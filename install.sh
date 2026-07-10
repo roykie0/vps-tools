@@ -9,8 +9,10 @@ readonly XUI_INSTALL_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/maste
 readonly SUI_INSTALL_URL="https://s-ui.alireza0.dev/install.sh"
 readonly SHORTCUT_NAME="roy"
 readonly LOCAL_SCRIPT_PATH="/usr/local/lib/vps-panel-setup/${SHORTCUT_NAME}"
+readonly ROY_DATA_DIR="/root/.roy"
+readonly PANEL_INFO_FILE="${ROY_DATA_DIR}/panel-info.conf"
+readonly NODE_INFO_FILE="${ROY_DATA_DIR}/nodes.txt"
 APT_INDEX_READY=false
-RECOMMENDED_NODE_PORTS=""
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -52,6 +54,16 @@ install_shortcut() {
   ln -sfn "$LOCAL_SCRIPT_PATH" "/usr/local/bin/${SHORTCUT_NAME}"
 }
 
+offer_disable_existing_ufw() {
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    warn "检测到旧配置中的 UFW 仍在运行，它可能限制面板或节点端口。"
+    if confirm "是否禁用 UFW，解除本机端口限制？"; then
+      ufw --force disable
+      say "UFW 已禁用。"
+    fi
+  fi
+}
+
 require_supported_os() {
   if [[ ! -r /etc/os-release ]]; then
     fail "无法识别系统版本。此脚本仅支持 Ubuntu 和 Debian。"
@@ -81,7 +93,7 @@ install_prerequisites() {
   info "正在安装基础工具..."
   export DEBIAN_FRONTEND=noninteractive
   refresh_package_index
-  apt-get install -y ca-certificates curl ufw
+  apt-get install -y ca-certificates curl
 }
 
 update_system() {
@@ -163,14 +175,6 @@ EOF
   say "文件句柄上限已写入，将在新的登录会话中生效。"
 }
 
-get_ssh_port() {
-  local port="22"
-  if command -v sshd >/dev/null 2>&1; then
-    port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}' || true)"
-  fi
-  printf '%s' "${port:-22}"
-}
-
 valid_port() {
   [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
@@ -236,18 +240,107 @@ normalize_path() {
   printf '/%s/' "$value"
 }
 
+get_server_ip() {
+  local ip="" url
+  for url in https://api4.ipify.org https://ipv4.icanhazip.com https://4.ident.me; do
+    ip="$(curl -4fsS --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "$ip"
+      return
+    fi
+  done
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  printf '%s' "${ip:-服务器IP}"
+}
+
+url_host() {
+  local host="$1"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
+}
+
+detect_web_scheme() {
+  local port="$1"
+  if curl -kIsS --max-time 3 "https://127.0.0.1:${port}/" >/dev/null 2>&1; then
+    printf 'https'
+  else
+    printf 'http'
+  fi
+}
+
+save_panel_info() {
+  local panel_type="$1" host="$2" port="$3" path="$4" username="$5" password="$6"
+  local sub_port="${7:-}" sub_path="${8:-}" panel_scheme="${9:-http}" sub_scheme="${10:-http}"
+  install -d -m 700 "$ROY_DATA_DIR"
+  {
+    printf 'PANEL_TYPE=%q\n' "$panel_type"
+    printf 'PANEL_HOST=%q\n' "$host"
+    printf 'PANEL_PORT=%q\n' "$port"
+    printf 'PANEL_PATH=%q\n' "$path"
+    printf 'PANEL_USERNAME=%q\n' "$username"
+    printf 'PANEL_PASSWORD=%q\n' "$password"
+    printf 'PANEL_SCHEME=%q\n' "$panel_scheme"
+    printf 'SUB_PORT=%q\n' "$sub_port"
+    printf 'SUB_PATH=%q\n' "$sub_path"
+    printf 'SUB_SCHEME=%q\n' "$sub_scheme"
+  } >"$PANEL_INFO_FILE"
+  chmod 600 "$PANEL_INFO_FILE"
+}
+
+show_saved_panel_info() {
+  if [[ ! -r "$PANEL_INFO_FILE" ]]; then
+    info "没有找到由本脚本保存的面板登录信息。"
+    return
+  fi
+
+  PANEL_TYPE="" PANEL_HOST="" PANEL_PORT="" PANEL_PATH=""
+  PANEL_USERNAME="" PANEL_PASSWORD="" PANEL_SCHEME="http"
+  SUB_PORT="" SUB_PATH="" SUB_SCHEME="http"
+  # shellcheck disable=SC1090
+  . "$PANEL_INFO_FILE"
+  local host
+  host="$(url_host "$PANEL_HOST")"
+  echo
+  printf '%b\n' "${CYAN}面板登录信息${RESET}"
+  printf '面板：%s\n' "$PANEL_TYPE"
+  printf '登录地址：%s://%s:%s%s\n' "$PANEL_SCHEME" "$host" "$PANEL_PORT" "$PANEL_PATH"
+  printf '用户名：%s\n' "$PANEL_USERNAME"
+  printf '密码：%s\n' "$PANEL_PASSWORD"
+  if [[ -n "$SUB_PORT" ]]; then
+    printf '订阅地址：%s://%s:%s%s\n' "$SUB_SCHEME" "$host" "$SUB_PORT" "$SUB_PATH"
+  fi
+  printf '信息文件：%s（仅 root 可读）\n' "$PANEL_INFO_FILE"
+}
+
+show_saved_nodes() {
+  echo
+  printf '%b\n' "${CYAN}节点信息${RESET}"
+  if [[ -r "$NODE_INFO_FILE" ]]; then
+    cat "$NODE_INFO_FILE"
+  elif [[ -r /root/s-ui-recommended-nodes.txt ]]; then
+    warn "S-UI 尚未自动创建可导入节点，下面是面板内的推荐配置入口："
+    cat /root/s-ui-recommended-nodes.txt
+  else
+    info "尚未保存可直接导入客户端的节点链接。"
+  fi
+}
+
 show_access_hint() {
-  local panel="$1" port="$2" path="$3"
+  local panel="$1" scheme="$2" host="$3" port="$4" path="$5"
   echo
   say "${panel} 已安装完成。"
-  info "后台地址： http://你的服务器IP:${port}${path}"
-  info "请在云服务商安全组和 UFW 中放行实际使用的端口。"
+  info "后台地址：${scheme}://${host}:${port}${path}"
+  info "本脚本不会限制端口；若外网打不开，请检查云服务商安全组。"
 }
 
 create_recommended_3x_nodes() {
   local username="$1" password="$2" panel_port="$3" panel_path="$4"
-  local main_port backup_port xray_bin keypair private_key short_id uuid ss_password
-  local cookie_file main_payload backup_payload panel_base main_result backup_result
+  local main_port backup_port xray_bin keypair private_key public_key short_id uuid ss_password
+  local cookie_file main_payload backup_payload panel_base panel_scheme main_result backup_result
+  local server_ip display_host ss_userinfo vless_link ss_link
 
   if ! confirm "是否自动创建无域名推荐节点？"; then
     return
@@ -264,21 +357,27 @@ create_recommended_3x_nodes() {
     return
   fi
 
-  keypair="$($xray_bin x25519)"
-  private_key="$(awk '/Private key:/ {print $3}' <<<"$keypair")"
-  if [[ -z "$private_key" ]]; then
+  keypair="$("$xray_bin" x25519 2>/dev/null || true)"
+  private_key="$(awk -F':[[:space:]]*' 'tolower($1) ~ /^private ?key$/ {print $2; exit}' <<<"$keypair")"
+  public_key="$(awk -F':[[:space:]]*' 'tolower($1) ~ /^(public ?key|password)$/ {print $2; exit}' <<<"$keypair")"
+  if [[ -z "$private_key" || -z "$public_key" ]]; then
     warn "无法生成 Reality 密钥，已跳过自动创建推荐节点。"
     return
   fi
   short_id="$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
-  ss_password="$(head -c 32 /dev/urandom | base64 | tr -d '=+/\n' | cut -c 1-32)"
+  ss_password="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
   cookie_file="$(mktemp)"
   main_payload="$(mktemp)"
   backup_payload="$(mktemp)"
-  panel_base="http://127.0.0.1:${panel_port}/${panel_path}"
+  panel_scheme="$(detect_web_scheme "$panel_port")"
+  panel_base="${panel_scheme}://127.0.0.1:${panel_port}/${panel_path}"
 
-  curl -fsS -c "$cookie_file" --data-urlencode "username=${username}" --data-urlencode "password=${password}" "${panel_base}/login" >/dev/null
+  if ! curl -kfsS -c "$cookie_file" --data-urlencode "username=${username}" --data-urlencode "password=${password}" "${panel_base}/login" >/dev/null; then
+    rm -f "$cookie_file" "$main_payload" "$backup_payload"
+    warn "无法登录 3x-ui API，已保留面板安装结果，但跳过自动创建节点。"
+    return
+  fi
   main_settings="$(printf '{"clients":[{"id":"%s","flow":"xtls-rprx-vision","email":"main-user"}],"decryption":"none"}' "$uuid")"
   main_stream="$(printf '{"network":"tcp","security":"reality","realitySettings":{"show":false,"dest":"www.microsoft.com:443","xver":0,"serverNames":["www.microsoft.com"],"privateKey":"%s","shortIds":["%s"]}}' "$private_key" "$short_id")"
   backup_settings="$(printf '{"clients":[{"email":"backup-user","method":"2022-blake3-aes-256-gcm","password":"%s"}],"network":"tcp,udp"}' "$ss_password")"
@@ -291,33 +390,61 @@ EOF
 {"remark":"备用-Shadowsocks-2022","enable":true,"port":${backup_port},"protocol":"shadowsocks","settings":"$(printf '%s' "$backup_settings" | json_escape)","streamSettings":"$(printf '%s' '{"network":"tcp","security":"none"}' | json_escape)","sniffing":"$(printf '%s' "$sniffing" | json_escape)"}
 EOF
 
-  main_result="$(curl -fsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${main_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
-  backup_result="$(curl -fsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${backup_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
+  main_result="$(curl -kfsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${main_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
+  backup_result="$(curl -kfsS -b "$cookie_file" -H 'Content-Type: application/json' --data-binary "@${backup_payload}" "${panel_base}/panel/api/inbounds/add" || true)"
   rm -f "$cookie_file" "$main_payload" "$backup_payload"
 
   if [[ "$main_result" == *'"success":true'* && "$backup_result" == *'"success":true'* ]]; then
-    RECOMMENDED_NODE_PORTS="${main_port},${backup_port}"
+    server_ip="$(get_server_ip)"
+    display_host="$(url_host "$server_ip")"
+    ss_userinfo="$(printf '2022-blake3-aes-256-gcm:%s' "$ss_password" | base64 | tr -d '\n=' | tr '+/' '-_')"
+    vless_link="vless://${uuid}@${display_host}:${main_port}?type=tcp&security=reality&pbk=${public_key}&fp=chrome&sni=www.microsoft.com&sid=${short_id}&spx=%2F&flow=xtls-rprx-vision#Roy-Main-Reality"
+    ss_link="ss://${ss_userinfo}@${display_host}:${backup_port}#Roy-Backup-SS2022"
+    install -d -m 700 "$ROY_DATA_DIR"
+    cat >"$NODE_INFO_FILE" <<EOF
+主用节点：VLESS + Reality + Vision
+端口：${main_port}
+导入链接：
+${vless_link}
+
+备用节点：Shadowsocks 2022
+端口：${backup_port}
+导入链接：
+${ss_link}
+EOF
+    chmod 600 "$NODE_INFO_FILE"
     systemctl restart x-ui >/dev/null 2>&1 || true
     say "已创建主用 VLESS Reality 和备用 Shadowsocks 2022 节点。"
-    info "节点端口：${RECOMMENDED_NODE_PORTS}；请在面板的入站列表中复制订阅或连接链接。"
+    info "完整节点链接已保存到：${NODE_INFO_FILE}"
+    show_saved_nodes
   else
     warn "推荐节点创建未完成。请在面板中手动检查入站列表，未成功的请求不会影响面板本身。"
   fi
 }
 
 create_s_ui_node_entry() {
-  local panel_port="$1" panel_path="$2" guide_file="/root/s-ui-recommended-nodes.txt"
+  local panel_port="$1" panel_path="$2" panel_scheme="$3" host guide_file="/root/s-ui-recommended-nodes.txt"
+  host="$(url_host "$(get_server_ip)")"
   cat >"$guide_file" <<EOF
 无域名推荐方案
-主用：VLESS + Reality + Vision
-备用：Shadowsocks 2022
+1. 主用：VLESS + Reality + Vision
+   建议端口：443（被占用时可换其他端口）
+   Reality 目标/SNI：www.microsoft.com:443 / www.microsoft.com
+   Flow：xtls-rprx-vision
+   在面板中生成 Reality 密钥、Short ID 和客户端 UUID
+
+2. 备用：Shadowsocks 2022
+   建议端口：8443
+   加密方式：2022-blake3-aes-256-gcm
+   网络：TCP + UDP
+   在面板中生成随机密码
 
 有域名推荐方案
 主用：Hysteria2 + TLS
 备用：VLESS + Reality + Vision
 
 请在 S-UI 后台的入站页面创建以上节点。面板地址：
-http://你的服务器IP:${panel_port}${panel_path}
+${panel_scheme}://${host}:${panel_port}${panel_path}
 EOF
   info "S-UI 推荐节点入口已生成：${guide_file}"
   info "无域名：主用 VLESS + Reality + Vision，备用 Shadowsocks 2022。"
@@ -401,7 +528,7 @@ run_security_hardening() {
 }
 
 install_3x_ui_chinese() {
-  local username password port path installer_file log_file
+  local username password port path installer_file log_file server_ip panel_scheme
   username="$(ask_text '请输入后台用户名' "admin$(random_text 5)")"
   password="$(ask_text '请输入后台密码' "$(random_text 16)")"
   port="$(ask_free_port '请输入后台端口' '2053')"
@@ -425,18 +552,19 @@ install_3x_ui_chinese() {
     return 1
   fi
   systemctl restart x-ui >>"$log_file" 2>&1 || true
+  server_ip="$(get_server_ip)"
+  panel_scheme="$(detect_web_scheme "$port")"
+  save_panel_info "3x-ui" "$server_ip" "$port" "/${path}" "$username" "$password" "" "" "$panel_scheme" "http"
   create_recommended_3x_nodes "$username" "$password" "$port" "$path"
   echo
   info "后台用户名：${username}"
   info "后台密码：${password}"
-  show_access_hint '3x-ui' "$port" "/${path}"
-  if confirm "是否现在配置 UFW 防火墙并放行后台端口 ${port}？"; then
-    configure_firewall "${port}${RECOMMENDED_NODE_PORTS:+,${RECOMMENDED_NODE_PORTS}}"
-  fi
+  show_access_hint '3x-ui' "$panel_scheme" "$(url_host "$server_ip")" "$port" "/${path}"
+  info "以后输入 roy，再选择“查看面板、登录信息、节点与安全服务状态”即可重新查看。"
 }
 
 install_s_ui_chinese() {
-  local username password panel_port panel_path sub_port sub_path installer_file log_file
+  local username password panel_port panel_path sub_port sub_path installer_file log_file server_ip panel_scheme sub_scheme
   username="$(ask_text '请输入后台用户名' "admin$(random_text 5)")"
   password="$(ask_text '请输入后台密码' "$(random_text 16)")"
   panel_port="$(ask_free_port '请输入后台端口' '2095')"
@@ -462,47 +590,17 @@ install_s_ui_chinese() {
   fi
   systemctl restart s-ui >>"$log_file" 2>&1 || true
   systemctl restart sing-box >>"$log_file" 2>&1 || true
+  server_ip="$(get_server_ip)"
+  panel_scheme="$(detect_web_scheme "$panel_port")"
+  sub_scheme="$(detect_web_scheme "$sub_port")"
+  save_panel_info "S-UI" "$server_ip" "$panel_port" "$panel_path" "$username" "$password" "$sub_port" "$sub_path" "$panel_scheme" "$sub_scheme"
   echo
   info "后台用户名：${username}"
   info "后台密码：${password}"
-  show_access_hint 'S-UI' "$panel_port" "$panel_path"
-  info "订阅地址格式： http://你的服务器IP:${sub_port}${sub_path}"
-  create_s_ui_node_entry "$panel_port" "$panel_path"
-  if confirm "是否现在配置 UFW 防火墙并放行后台与订阅端口？"; then
-    configure_firewall "${panel_port},${sub_port}"
-  fi
-}
-
-configure_firewall() {
-  install_prerequisites
-  local ssh_port extra_ports raw_port suggested_ports="${1:-}"
-  ssh_port="$(get_ssh_port)"
-
-  warn "防火墙会默认拒绝入站连接，但会保留当前 SSH 端口 ${ssh_port}。"
-  if ! confirm "是否继续配置 UFW 防火墙？"; then
-    return
-  fi
-
-  read -r -e -i "$suggested_ports" -p "请输入要额外放行的端口（用逗号分隔；例如 80,443,2095,2096；可留空）: " extra_ports
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow "${ssh_port}/tcp" comment 'SSH access'
-
-  if [[ -n "${extra_ports//[[:space:]]/}" ]]; then
-    IFS=',' read -r -a ports <<<"$extra_ports"
-    for raw_port in "${ports[@]}"; do
-      raw_port="${raw_port//[[:space:]]/}"
-      if valid_port "$raw_port"; then
-        ufw allow "$raw_port" comment 'Panel or service port'
-      else
-        warn "忽略无效端口：${raw_port}"
-      fi
-    done
-  fi
-
-  ufw --force enable
-  say "UFW 已启用。请确认云服务商安全组也放行了需要的端口。"
-  ufw status numbered
+  show_access_hint 'S-UI' "$panel_scheme" "$(url_host "$server_ip")" "$panel_port" "$panel_path"
+  info "订阅地址：${sub_scheme}://$(url_host "$server_ip"):${sub_port}${sub_path}"
+  create_s_ui_node_entry "$panel_port" "$panel_path" "$panel_scheme"
+  info "以后输入 roy，再选择“查看面板、登录信息、节点与安全服务状态”即可重新查看。"
 }
 
 run_optimization() {
@@ -528,11 +626,14 @@ run_installer() {
     xui) install_3x_ui_chinese ;;
     sui) install_s_ui_chinese ;;
   esac
-  info "建议接着在主菜单选择“配置防火墙”，放行你实际设置的面板和节点端口。"
 }
 
 show_service_status() {
   echo
+  show_saved_panel_info
+  show_saved_nodes
+  echo
+  printf '%b\n' "${CYAN}服务运行状态${RESET}"
   if systemctl is-active --quiet x-ui; then
     say "3x-ui 服务正在运行。"
   else
@@ -553,6 +654,23 @@ show_service_status() {
   else
     info "Fail2Ban 未启用。"
   fi
+
+  if [[ ! -r "$PANEL_INFO_FILE" ]]; then
+    if command -v x-ui >/dev/null 2>&1; then
+      echo
+      info "尝试读取现有 3x-ui 设置："
+      x-ui settings 2>/dev/null || true
+    elif [[ -x /usr/local/s-ui/sui ]]; then
+      echo
+      info "尝试读取现有 S-UI 地址与管理员信息："
+      /usr/local/s-ui/sui uri 2>/dev/null || true
+      /usr/local/s-ui/sui admin -show 2>/dev/null || true
+    fi
+  fi
+
+  echo
+  info "3x-ui 安装日志：/var/log/vps-panel-3x-ui-install.log"
+  info "S-UI 安装日志：/var/log/vps-panel-s-ui-install.log"
 }
 
 show_header() {
@@ -573,25 +691,24 @@ main_menu() {
 3) 执行安全加固（自动安全更新与 Fail2Ban）
 4) 安装 3x-ui（Xray 管理面板）
 5) 安装 S-UI（Sing-box 管理面板）
-6) 配置 UFW 防火墙
-7) 查看面板与安全服务状态
+6) 查看面板、登录信息、节点与安全服务状态
 0) 退出
 EOF
-    read -r -p "请输入选项 [0-7]: " choice
+    read -r -p "请输入选项 [0-6]: " choice
     case "$choice" in
       1) run_optimization; pause ;;
       2) configure_network_acceleration; pause ;;
       3) run_security_hardening; pause ;;
       4) run_installer "3x-ui" 'xui'; pause ;;
       5) run_installer "S-UI" 'sui'; pause ;;
-      6) configure_firewall; pause ;;
-      7) show_service_status; pause ;;
+      6) show_service_status; pause ;;
       0) info "已退出。"; exit 0 ;;
-      *) warn "请输入 0 到 7 之间的数字。"; pause ;;
+      *) warn "请输入 0 到 6 之间的数字。"; pause ;;
     esac
   done
 }
 
 require_root
 install_shortcut
+offer_disable_existing_ufw
 main_menu
