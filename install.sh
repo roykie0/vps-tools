@@ -568,24 +568,24 @@ main_menu() {
   while true; do
     show_header
     cat <<'EOF'
-1) 安装 3x-ui（Xray 管理面板）
-2) 安装 S-UI（Sing-box 管理面板）
-3) 执行 VPS 基础优化
-4) 配置 UFW 防火墙
-5) 执行安全加固（自动安全更新与 Fail2Ban）
-6) 查看面板与安全服务状态
-7) 执行网络速度优化（BBR、MTU 探测、TCP Fast Open）
+1) 执行 VPS 基础优化
+2) 执行网络速度优化（BBR、MTU 探测、TCP Fast Open）
+3) 执行安全加固（自动安全更新与 Fail2Ban）
+4) 安装 3x-ui（Xray 管理面板）
+5) 安装 S-UI（Sing-box 管理面板）
+6) 配置 UFW 防火墙
+7) 查看面板与安全服务状态
 0) 退出
 EOF
     read -r -p "请输入选项 [0-7]: " choice
     case "$choice" in
-      1) run_installer "3x-ui" 'xui'; pause ;;
-      2) run_installer "S-UI" 'sui'; pause ;;
-      3) run_optimization; pause ;;
-      4) configure_firewall; pause ;;
-      5) run_security_hardening; pause ;;
-      6) show_service_status; pause ;;
-      7) configure_network_acceleration; pause ;;
+      1) run_optimization; pause ;;
+      2) configure_network_acceleration; pause ;;
+      3) run_security_hardening; pause ;;
+      4) run_installer "3x-ui" 'xui'; pause ;;
+      5) run_installer "S-UI" 'sui'; pause ;;
+      6) configure_firewall; pause ;;
+      7) show_service_status; pause ;;
       0) info "已退出。"; exit 0 ;;
       *) warn "请输入 0 到 7 之间的数字。"; pause ;;
     esac
@@ -595,4 +595,3 @@ EOF
 require_root
 install_shortcut
 main_menu
-
